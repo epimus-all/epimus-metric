@@ -83,15 +83,199 @@ select iops, throughput from network_data where id = "$id" and ts < "$ts"
 #取决于promql附带的时间参数
 ```
 
+## 查询逻辑
+### Promql的词法解析
+沿用fe使用的框架jflex，来对promql进行词法解析，将promql分隔成一个个固定的token
+
+```sql
+package com.doris.promql.core;
+import java_cup.runtime.Symbol;
+%%
+%public
+%class PromQLLexer
+%unicode
+%cup
+
+%{
+  private Symbol symbol(int type) {
+    return new Symbol(type, yyline, yycolumn);
+  }
+
+  private Symbol symbol(int type, Object value) {
+    return new Symbol(type, yyline, yycolumn, value);
+  }
+
+  // 处理字符串转义（例如 "\"", "\\n"）
+  private String parseString(String text) {
+    StringBuilder sb = new StringBuilder();
+    for (int i = 1; i < text.length() - 1; i++) {
+      char c = text.charAt(i);
+      if (c == '\\') {
+        char next = text.charAt(++i);
+        switch (next) {
+          case 'n': sb.append('\n'); break;
+          case 't': sb.append('\t'); break;
+          case '\\': sb.append('\\'); break;
+          case '"': sb.append('"'); break;
+          default: sb.append(next); break;
+        }
+      } else {
+        sb.append(c);
+      }
+    }
+    return sb.toString();
+  }
+%}
+
+// 正则定义
+Identifier = [a-zA-Z_][a-zA-Z0-9_]*
+Number = [0-9]+(\.[0-9]+)?
+Duration = [0-9]+(ms|s|m|h|d|w|y)
+String = \"([^\\\"]|\\.)*\"
+
+// 操作符
+%%
+"="     { return symbol(sym.EQ); }
+"!="    { return symbol(sym.NEQ); }
+"=~"    { return symbol(sym.REGEX_EQ); }
+"!~"    { return symbol(sym.REGEX_NEQ); }
+"+"     { return symbol(sym.OPERATOR, "+"); }
+"-"     { return symbol(sym.OPERATOR, "-"); }
+"*"     { return symbol(sym.OPERATOR, "*"); }
+"/"     { return symbol(sym.OPERATOR, "/"); }
+"^"     { return symbol(sym.OPERATOR, "^"); }
+"and"   { return symbol(sym.OPERATOR, "and"); }
+"or"    { return symbol(sym.OPERATOR, "or"); }
+"unless"    { return symbol(sym.OPERATOR, "unless"); }
+","    { return symbol(sym.COMMA); }
+
+// 关键字
+"offset" { return symbol(sym.OFFSET); }
+"by"     { return symbol(sym.BY); }
+"without" { return symbol(sym.WITHOUT); }
+
+// 其他符号
+"{"      { return symbol(sym.LBRACE); }
+"}"      { return symbol(sym.RBRACE); }
+// ... 其他符号类似处理
+
+{Identifier} { return symbol(sym.IDENTIFIER, yytext()); }
+{Duration}   { return symbol(sym.DURATION, yytext()); }
+{Number}     { return symbol(sym.NUMBER, Long.parseLong(yytext())); }
+{String}     { return symbol(sym.STRING, parseString(yytext())); }
+
+// 空白符忽略
+[ \t\n\r]    { /* ignore */ }
+
+// 错误处理
+.           { throw new RuntimeException("Illegal char: " + yytext()); }
+```
+
+### Promql的语法解析
+沿用fe使用的jcup框架，对promql进行词法解析
+
+```sql
+// 包声明和导入
+package com.doris.promql.core;
+import java.util.*;
+
+// ------------------------------
+// 终结符定义（需与 JFlex 词法分析器匹配）
+// ------------------------------
+ terminal LPAREN, RPAREN, LBRACE, RBRACE, LBRACKET, RBRACKET,AVG,RATE,OFFSET,REGEX_EQ,REGEX_NEQ,QT,GEQ,LEQ,UMINUS;
+ terminal ADD, SUB, MUL, DIV, GE, LE, UNLESS,SUM,OR,MIN,COUNT,RE,NEQ,MOD,POW,MAX,LT,GT,AND;
+ terminal EQ, NE, COMMA,NRE,AGGREGATION_OP,OPERATOR;
+ terminal BY, WITHOUT;
+ terminal String DURATION, IDENTIFIER,STRING;
+ terminal Number NUMBER;
+
+// ------------------------------
+// 非终结符定义
+// ------------------------------
+non terminal VectorSelector expr;              // 表达式根节点
+non terminal VectorSelector vectorSelector;    // 即时向量选择器
+non terminal String matrixSelector;   // 范围向量选择器
+non terminal String functionCall;     // 函数调用
+non terminal String aggregation;      // 聚合表达式
+non terminal List<LabelMatcher> labelMatchers;    // 标签匹配条件
+non terminal LabelMatcher labelMatcher;     // 单个标签条件
+non terminal String grouping;         // "by" 或 "without" 分组
+
+// ------------------------------
+// 优先级与结合性（从低到高）
+// ------------------------------
+precedence left OR;
+precedence left AND, UNLESS;
+precedence left EQ, NEQ, REGEX_EQ, REGEX_NEQ, QT, LT, GEQ, LEQ;
+precedence left ADD, SUB;
+precedence left MUL, DIV, MOD;
+precedence left POW;
+precedence left UMINUS, OFFSET;
+
+// ------------------------------
+// 语法规则
+// ------------------------------
+
+// 根规则
+start with expr;
+
+// 表达式可以是多种形式
+expr ::=
+    vectorSelector:e                  {: RESULT = e; :}
+//  | matrixSelector:e                  {: RESULT = e; :}
+  ;
+
+// 即时向量选择器（例如：http_requests_total{job="api",env=~"prod|staging"}）
+vectorSelector ::=
+    IDENTIFIER:name LBRACE labelMatchers:matchers RBRACE {: RESULT = new VectorSelector(name, matchers); :}
+  ;
+
+// 范围向量选择器（例如：http_requests_total[5m]）
+//matrixSelector ::=
+//    vectorSelector:v LBRACKET DURATION:d RBRACKET  {: RESULT = new MatrixSelector(v, d); :}
+//  ;
+
+// 函数调用（例如：rate(http_requests_total[5m])）
+//functionCall ::=
+//    IDENTIFIER:funcName LPAREN expr:e COMMA RPAREN  {: RESULT = new FunctionCall(funcName, e); :}
+//  | IDENTIFIER:funcName LPAREN RPAREN                {: RESULT = new FunctionCall(funcName, null); :}
+//  ;
+
+// 聚合表达式（例如：sum by (job) (http_requests_total)）
+//aggregation ::=
+//    AGGREGATION_OP:op grouping:g LPAREN expr:e RPAREN  {: RESULT = new Aggregation(op, g, e); :}
+//  ;
+
+// 标签匹配条件（例如：{job="api", env!="dev"}）
+labelMatchers ::=
+  labelMatcher:matcher                                          {: RESULT = new ArrayList<>(); RESULT.add(matcher); :}
+  | labelMatchers:labelMatchers COMMA labelMatcher:matcher      {: labelMatchers.add(matcher); RESULT = labelMatchers; :}
+  ;
+
+// 单个标签匹配（例如：job="api" 或 status=~"5.."）
+labelMatcher ::=
+    IDENTIFIER:labelName EQ STRING:value        {: RESULT = new LabelMatcher(labelName, "=", value); :}
+  | IDENTIFIER:labelName NEQ STRING:value       {: RESULT = new LabelMatcher(labelName, "!=", value); :}
+  | IDENTIFIER:labelName REGEX_EQ STRING:value  {: RESULT = new LabelMatcher(labelName, "=~", value); :}
+  | IDENTIFIER:labelName REGEX_NEQ STRING:value {: RESULT = new LabelMatcher(labelName, "!~", value); :}
+  ;
+```
 
 
-## Promql协议转换
+
+这里先简单点儿，弄个vectorSelector就可以使用了，目前还不能支持很复杂的模式，只能支持最简单的
+sss{a="a", b="b"}
+
+```java
+public static void main(String[] args) throws Exception {
+    PromQLLexer promQLLexer = new PromQLLexer(new StringReader("sss{a=\"a\", b=\"b\"}"));
+    PromqlParser parser = new PromqlParser(promQLLexer);
+    VectorSelector vectorSelector = (VectorSelector) parser.parse().value;
+    System.out.println("vectorSelector = " + vectorSelector);
+}
+```
+
+
+## 导入逻辑
+### Remote Write协议转换
 TODO
-
-
-
-## Remote Write协议转换
-TODO
-
-
-
